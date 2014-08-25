@@ -34,7 +34,7 @@ To start, let's look at a ``[subscriptions:hostname]`` section.
     apache.subs = apache/example+refs/heads/prod
 
 A ``[subscriptions:hostname]`` section may contain many of these pairs,
-so long as each pair has a ``.url`` parameter and a ``.subs```
+so long as each pair has a ``.url`` parameter and a ``.subs``
 parameter.  Pullbot begins by matching the ``repo`` key from the JSON
 postdata to each of the ``.url`` parameters in turn[1].  If a match
 occurs, the corresponding ``.subs`` parameter is used to determine what
@@ -81,7 +81,7 @@ alphanumeric sort order.  So let's consider a more complete configuration:
 	99httpd.url = *connect-web*
 	99httpd.subs = httpd
 
-Under this configuration, the /same/ POST would trigger the same ``git pull``
+Under this configuration, the _same_ POST would trigger the same ``git pull``
 operation -- but would additionally restart Apache when done.  That would
 happen because the ``99httpd.url`` parameter matches the URL of the affected
 upstream repo (using shell style globs, not regular expressions), and because
