@@ -1,0 +1,196 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import json
+import ConfigParser
+import re
+import fnmatch
+import socket
+
+DEFAULTS = '''
+[pullbot]
+listen = localhost:8666
+
+[repos]
+*.cmd = echo "No command for %(subscriber)s (%(path)s+%(ref)s)"
+'''
+
+class Config(ConfigParser.RawConfigParser):
+	def getlist(self, section, option):
+		return [x.strip() for x in self.get(section, option).split(',')]
+
+class pullbot(object):
+	def __init__(self):
+		import StringIO
+		self.config = Config()
+		fp = StringIO.StringIO(DEFAULTS)
+		self.config.readfp(fp)
+		fp.close()
+		self.program = os.path.basename(sys.argv[0])
+
+	def __call__(self, environ, start_response):
+		headers = [ ('Content-type:', 'text/plain'), ]
+		def badreq(*msgs):
+			start_response('400 Bad Request', headers)
+			return msgs
+
+		try:
+			length = int(environ.get('CONTENT_LENGTH', 0))
+			request = environ['wsgi.input'].read(length)
+			request = json.loads(request)
+		except Exception, e:
+			return badreq(str(e))
+
+		# Check expected elements of request
+		for param in 'ref user_id project_id repository'.split():
+			if param not in request:
+				return badreq('no "%s" attribute in request' % param)
+
+		# Looks ok.
+
+		# See whether we should react.
+		ref = request['ref']
+		repo = request['repository']['url']
+
+		debug = False
+		if self.config.has_option('pullbot', 'debug'):
+			debug = self.config.getboolean('pullbot', 'debug')
+
+		def ok(*msgs):
+			r = {
+				'repo': repo,
+				'ref': ref,
+			}
+			r['status'] = []
+			for msg in msgs:
+				if hasattr(msg, 'lower'):
+					r['status'].append(msg)
+				else:
+					r.update(msg)
+			start_response('200 OK', headers)
+			if debug:
+				self.debug(json.dumps(r))
+			return json.dumps(r)
+
+		# First thing: if there are no subscribers we can't do anything.
+		subssection = None
+		for name in ('subscriptions:' + socket.gethostname(), 'subscriptions'):
+			if self.config.has_section(name):
+				subssection = name
+				break
+
+		if not subssection:
+			return ok('no subscriptions')
+
+		# Find subscription config
+		options = self.config.items(subssection)
+
+		# Get subscription names
+		subscriptions = [(k.rsplit('.', 1)[0], v)
+		                 for k, v in options
+		                 if k.endswith('.url')]
+		# Sort, in case order matters
+		subscriptions.sort()
+
+		# See which subscriptions match
+		def match(pattern, s):
+			if pattern.startswith('/'):
+				pattern = pattern[1:]
+				if pattern.endswith('/'):
+					pattern = pattern[:-1]
+				r = re.compile(pattern, re.I)
+				return r.match(s)
+
+			else:
+				return fnmatch.fnmatch(s, pattern)
+		matching = [sub for sub, pat in subscriptions if match(pat, repo)]
+
+		# Get the subscriber specs for those matches
+		subscribed = []
+		for sub in matching:
+			subscribed.extend(self.config.getlist(subssection, sub + '.subs'))
+
+		# Split subscriber, ref and filter to matching refs
+		subscribers = []
+		for sub in subscribed:
+			if '+' not in sub:
+				subscribers.append(sub)
+			else:
+				sub, subref = sub.split('+', 1)
+				if match(subref, ref):
+					subscribers.append(sub)
+
+		# Subscribers lists the subscribers we need to notify.
+		# Currently the only 'notification' is to do a pull
+		success, fail = 0, 0
+		for sub in subscribers:
+			if not self.config.has_option('repos', sub):
+				pass
+			if self.notify(sub, repo, ref):
+				success += 1
+			else:
+				fail += 1
+
+		return ok({'total': 0, 'success': success, 'fail': fail})
+
+	def notify(self, sub, repo, ref):
+		path = self.config.get('repos', sub + '.path')
+		if self.config.has_option('repos', sub + '.cmd'):
+			cmd = self.config.get('repos', sub + '.cmd')
+		else:
+			cmd = self.config.get('repos', '*.cmd')
+		d = {
+			'subscriber': sub,
+			'repo': repo,
+			'ref': ref,
+			'path': path,
+		}
+		script = ('cd %(path)s; ' + cmd) % d
+		fp = os.popen('/bin/sh', 'w')
+		fp.write(script + '\n')
+		# None on success
+		try:
+			return fp.close() == None
+		except:
+			return False
+
+	def log(self, *msgs):
+		sys.stdout.write(self.program + ': ' + ' '.join(msgs) + '\n')
+		sys.stdout.flush()
+
+	def debug(self, *msgs):
+		sys.stdout.write(self.program + ': DEBUG: ' + ' '.join(msgs) + '\n')
+		sys.stdout.flush()
+
+	@classmethod
+	def wsgiapp(cls, environ, start_response):
+		app = cls()
+		app.config.read('/etc/pullbot.ini')
+		for dir in (os.path.dirname(sys.argv[0]), environ.get('DOCUMENT_ROOT')):
+			if dir:
+				app.config.read(os.path.join(dir, 'pullbot.ini'))
+		return app
+
+	@classmethod
+	def main(cls, args):
+		import wsgiref.simple_server
+		app = cls.wsgiapp(os.environ, None)
+
+		if len(args) == 2 and args[0] == 'listen':
+			app.config.set('pullbot', 'listen', args[2])
+		elif len(args) == 1 and args[0] == 'config':
+			app.config.write(sys.stdout)
+			return 0
+
+		host, port = app.config.get('pullbot', 'listen').split(':', 1)
+		port = int(port)
+		server = wsgiref.simple_server.make_server(host, port, app)
+		app.log('Listening at %s:%d.' % (host, port))
+		server.serve_forever()
+
+
+if __name__ == '__main__':
+	sys.exit(pullbot.main(sys.argv[1:]))
+else:
+	application = pullbot.wsgiapp
